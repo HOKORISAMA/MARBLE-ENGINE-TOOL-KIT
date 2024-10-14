@@ -1,0 +1,265 @@
+﻿using System;
+using System.IO;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.PixelFormats;
+using SixLabors.ImageSharp.Processing;
+
+public class PrsMetaData
+{
+    public int Width { get; }
+    public int Height { get; }
+    public int Bpp { get; }
+    public byte Flag { get; }
+    public int PackedSize { get; }
+
+    public PrsMetaData(int width, int height, int bpp, byte flag, int packedSize)
+    {
+        Width = width;
+        Height = height;
+        Bpp = bpp;
+        Flag = flag;
+        PackedSize = packedSize;
+    }
+}
+
+public class PrsReader
+{
+    private static readonly int[] LengthTable = new int[0x100];
+    private readonly string filePath;
+    private readonly PrsMetaData metadata;
+    private readonly int depth;
+    private readonly byte[] output;
+    private readonly int stride;
+    private string format;
+
+    static PrsReader()
+    {
+        for (int i = 0; i < 0xFE; i++)
+        {
+            LengthTable[i] = i + 3;
+        }
+        LengthTable[0xFE] = 0x400;
+        LengthTable[0xFF] = 0x1000;
+    }
+
+    public PrsReader(string filePath, PrsMetaData metadata)
+    {
+        this.filePath = filePath;
+        this.metadata = metadata;
+        depth = metadata.Bpp / 8;
+        format = depth == 4 ? "RGBA" : "RGB";
+        stride = metadata.Width * depth;
+        output = new byte[stride * metadata.Height];
+    }
+
+    public void Unpack()
+    {
+        using (var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+        {
+            fileStream.Seek(0x10, SeekOrigin.Begin);
+            int dst = 0;
+            int remaining = metadata.PackedSize;
+            int bit = 0;
+            int ctl = 0;
+
+            while (remaining > 0 && dst < output.Length)
+            {
+                bit >>= 1;
+                if (bit == 0)
+                {
+                    ctl = fileStream.ReadByte();
+                    remaining--;
+                    bit = 0x80;
+                }
+
+                if ((ctl & bit) == 0)
+                {
+                    output[dst++] = (byte)fileStream.ReadByte();
+                    remaining--;
+                    continue;
+                }
+
+                int b = fileStream.ReadByte();
+                remaining--;
+
+                int length = 0;
+                int shift = 0;
+
+                if ((b & 0x80) != 0)
+                {
+                    shift = fileStream.ReadByte();
+                    remaining--;
+                    shift |= (b & 0x3F) << 8;
+
+                    if ((b & 0x40) != 0)
+                    {
+                        int offset = fileStream.ReadByte();
+                        remaining--;
+                        length = LengthTable[offset];
+                    }
+                    else
+                    {
+                        length = (shift & 0xF) + 3;
+                        shift >>= 4;
+                    }
+                }
+                else
+                {
+                    length = b >> 2;
+                    b &= 3;
+                    if (b == 3)
+                    {
+                        length += 9;
+                        fileStream.Read(output, dst, length);
+                        dst += length;
+                        remaining -= length;
+                        continue;
+                    }
+                    shift = length;
+                    length = b + 2;
+                }
+
+                shift += 1;
+                if (dst < shift)
+                    throw new InvalidDataException("Invalid offset value");
+
+                length = Math.Min(length, output.Length - dst);
+
+                for (int i = 0; i < length; i++)
+                {
+                    output[dst] = (byte)((output[dst - shift] + output[dst]) % 256);
+                    dst++;
+                }
+            }
+
+            if ((metadata.Flag & 0x80) != 0)
+            {
+                for (int i = depth; i < output.Length; i++)
+                {
+                    output[i] = (byte)((output[i] + output[i - depth]) % 256);
+                }
+            }
+
+            if (depth == 4 && IsDummyAlphaChannel())
+            {
+                format = "RGB";
+            }
+
+            ConvertColors();
+        }
+    }
+
+    private bool IsDummyAlphaChannel()
+    {
+        byte alpha = output[3];
+        if (alpha == 0xFF)
+            return false;
+
+        for (int i = 7; i < output.Length; i += 4)
+        {
+            if (output[i] != alpha)
+                return false;
+        }
+        return true;
+    }
+
+    private void ConvertColors()
+    {
+        if (format == "RGB")
+        {
+            for (int i = 0; i < output.Length; i += 3)
+            {
+                (output[i], output[i + 2]) = (output[i + 2], output[i]);
+            }
+        }
+        else if (format == "RGBA")
+        {
+            for (int i = 0; i < output.Length; i += 4)
+            {
+                (output[i], output[i + 2]) = (output[i + 2], output[i]);
+            }
+        }
+    }
+
+    public Image<Rgba32> GetImage()
+    {
+        if (format == "RGB")
+        {
+            Image<Rgba32> image = new Image<Rgba32>(metadata.Width, metadata.Height);
+            for (int y = 0; y < metadata.Height; y++)
+            {
+                for (int x = 0; x < metadata.Width; x++)
+                {
+                    int idx = (y * stride) + (x * 3);
+                    image[x, y] = new Rgba32(output[idx], output[idx + 1], output[idx + 2]);
+                }
+            }
+            return image;
+        }
+        else
+        {
+            return Image.LoadPixelData<Rgba32>(output, metadata.Width, metadata.Height);
+        }
+    }
+}
+
+public class Program
+{
+    public static PrsMetaData ReadMetadata(string filePath)
+    {
+        using (var fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+        {
+            byte[] header = new byte[16];
+            fileStream.Read(header, 0, 16);
+
+            if (header[0] != 'Y' || header[1] != 'B')
+                return null;
+
+            int bpp = header[3];
+            if (bpp != 3 && bpp != 4)
+                return null;
+
+            return new PrsMetaData(
+                BitConverter.ToUInt16(header, 12),
+                BitConverter.ToUInt16(header, 14),
+                8 * bpp,
+                header[2],
+                BitConverter.ToInt32(header, 4)
+            );
+        }
+    }
+
+    public static void ConvertPrsToPng(string inputDir, string outputDir)
+    {
+        if (!Directory.Exists(outputDir))
+            Directory.CreateDirectory(outputDir);
+
+        foreach (var fileName in Directory.GetFiles(inputDir, "*.prs"))
+        {
+            var metadata = ReadMetadata(fileName);
+            if (metadata != null)
+            {
+                var reader = new PrsReader(fileName, metadata);
+                reader.Unpack();
+                var image = reader.GetImage();
+                string outputFilePath = Path.Combine(outputDir, Path.GetFileNameWithoutExtension(fileName) + ".png");
+                image.Save(outputFilePath);
+                Console.WriteLine($"Converted {fileName} to {outputFilePath}");
+            }
+        }
+    }
+
+    public static void Main(string[] args)
+    {
+        if (args.Length < 2)
+        {
+            Console.WriteLine("Prs2Png <input_dir> <output_dir>");
+            return;
+        }
+
+        string inputDir = args[0];
+        string outputDir = args[1];
+
+        ConvertPrsToPng(inputDir, outputDir);
+    }
+}
