@@ -1,12 +1,11 @@
-#*-* encoding:cp932*-*
+#*-* encoding:utf-8*-*
 import os
 import sys
 import json
 from struct import unpack
 from typing import BinaryIO, Dict, List, Tuple
 
-KEY = 'osyaburiana'.encode('cp932') # Use Garbro for keys
-FALLBACK_KEY = '女教師ゆうこ1968'.encode('cp932')
+KEY = '女教師ゆうこ1968'.encode('cp932') # Use Garbro for keys
 
 def unpack_uint32(file: BinaryIO, offset: int) -> int:
     file.seek(offset)
@@ -39,7 +38,7 @@ def process_mbl(input_file: str, output_dir: str) -> None:
     data_entries: Dict[str, str] = {}
     parameter_sets = [
         {"entry_size": 0x40, "name_offset": 0x00, "file_offset": 0x38, "size_offset": 0x3C, "key": KEY},
-        {"entry_size": 0x18, "name_offset": 0x00, "file_offset": 0x10, "size_offset": 0x14, "key": FALLBACK_KEY}
+        {"entry_size": 0x18, "name_offset": 0x00, "file_offset": 0x10, "size_offset": 0x14, "key": KEY}
     ]
 
     with open(input_file, 'rb') as f:
