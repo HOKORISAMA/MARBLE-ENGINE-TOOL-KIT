@@ -11,8 +11,8 @@ def hex_to_bytes(hex_string: str) -> bytes:
     """Convert a hex string to bytes."""
     return bytes.fromhex(hex_string)
 
-def pack_files(input_dir: str, output_file: str, json_file: str):
-    """Pack files using names, data, and parameters from the JSON file into a single archive."""
+def pack_files(input_dir: str, output_file: str, json_file: str, patch: str):
+    """Pack available files using names, data, and parameters from the JSON file into a single archive."""
     with open(json_file, 'r', encoding='utf-8') as jf:
         json_data = json.load(jf)
     
@@ -25,7 +25,10 @@ def pack_files(input_dir: str, output_file: str, json_file: str):
     file_offset = parameters['file_offset']
     SIZE_OFFSET = parameters['size_offset']
 
-    file_count = len(file_info)
+    # Filter out missing files
+    available_files = {k: v for k, v in file_info.items() if os.path.isfile(os.path.join(input_dir, k))}
+    file_count = len(available_files)
+    
     header_size = 4 + file_count * ENTRY_SIZE  # 4 bytes for count + ENTRY_SIZE bytes for each file entry
     current_offset = header_size + 4  # Adjust for the additional 4 null bytes
 
@@ -33,7 +36,7 @@ def pack_files(input_dir: str, output_file: str, json_file: str):
         archive.write(pack('<I', file_count))
         
         # Prepare the header
-        for i, (file_name, hex_data) in enumerate(file_info.items()):
+        for i, (file_name, hex_data) in enumerate(available_files.items()):
             file_path = os.path.join(input_dir, file_name)
             
             with open(file_path, 'rb') as f:
@@ -50,10 +53,11 @@ def pack_files(input_dir: str, output_file: str, json_file: str):
             archive.write(name_encoded)
             archive.write(b'\x00' * (NAME_OFFSET + ENTRY_SIZE - len(name_encoded)))
             
-            # Write additional data from JSON
-            binary_data = hex_to_bytes(hex_data)
-            archive.seek(entry_start)
-            archive.write(binary_data[:ENTRY_SIZE])
+            # Write additional data from JSON unless patch mode is enabled
+            if patch.lower() != 'yes':
+                binary_data = hex_to_bytes(hex_data)
+                archive.seek(entry_start)
+                archive.write(binary_data[:ENTRY_SIZE])
             
             # Write offset and size
             archive.seek(entry_start + file_offset)
@@ -69,7 +73,7 @@ def pack_files(input_dir: str, output_file: str, json_file: str):
 
         # Write file data
         archive.seek(header_size + 4)  # Move past the 4 null bytes
-        for file_name in file_info.keys():
+        for file_name in available_files.keys():
             file_path = os.path.join(input_dir, file_name)
             with open(file_path, 'rb') as f:
                 data = f.read()
@@ -79,10 +83,11 @@ def pack_files(input_dir: str, output_file: str, json_file: str):
     print(f"Packed {file_count} files into {output_file}")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print("Usage: python PkMgData.py <input_directory> <output_archive> <json_file>")
+    if len(sys.argv) < 5:
+        print("Usage: python PkMgData.py <input_directory> <output_archive> <json_file> <patch (yes|no)>")
         sys.exit(1)
     input_directory = sys.argv[1]
     output_archive = sys.argv[2]
     json_file = sys.argv[3]
-    pack_files(input_directory, output_archive, json_file)
+    patch_mode = sys.argv[4]
+    pack_files(input_directory, output_archive, json_file, patch_mode)
