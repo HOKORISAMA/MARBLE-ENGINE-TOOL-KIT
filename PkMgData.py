@@ -50,7 +50,7 @@ def pack_files(input_dir: str, output_file: str, json_file: str, patch: str):
             
             # Write filename
             name_encoded = file_name.encode('cp932')
-            archive.write(name_encoded)
+            archive.write(name_encoded + b'\x00S')
             archive.write(b'\x00' * (NAME_OFFSET + ENTRY_SIZE - len(name_encoded)))
             
             # Write additional data from JSON unless patch mode is enabled
