@@ -1,7 +1,7 @@
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 
-namespace Marble
+namespace MarbleEngineTools
 {
     public class PrsWriter
     {
