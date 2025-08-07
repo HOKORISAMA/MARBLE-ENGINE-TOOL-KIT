@@ -1,67 +1,118 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 
-namespace Marble
+namespace MarbleEngineTools
 {
     public class MblOpener
     {
-        private readonly ArcOpen _arcFile;
-        private readonly IList<Entry> _entries;
-        private readonly byte[] _key;
-        private string _version;  // Added to store version
-
-        public MblOpener(string filepath, string key)
+        public void Unpack(string inputPath, string outputPath, string key = null)
         {
-            _arcFile = new ArcOpen(filepath ?? throw new ArgumentNullException(nameof(filepath)));
-            _entries = new List<Entry>();
-            _key = ArcEncoding.Shift_JIS.GetBytes(key); //ArcEncoding.Shift_JIS.GetBytes("女教師ゆうこ1968");
-            _version = "unknown";
+            using var fs = new FileStream(inputPath, FileMode.Open, FileAccess.Read);
+            using var br = new BinaryReader(fs);
+            byte[] keyBytes = string.IsNullOrEmpty(key) ? null : 
+                ArcEncoding.Shift_JIS.GetBytes(key);
+            
+            Console.WriteLine($"Reading archive: {Path.GetFileName(inputPath)}");
+            uint fileCount = br.ReadUInt32();
+            if (!IsSaneCount(fileCount))
+            {
+                throw new InvalidDataException($"File count is not sane: {fileCount}");
+            }
+            
+            Console.WriteLine($"File count: {fileCount}");
+            uint filenameLen = br.ReadUInt32();
+            string version = "unknown";
+            List<Entry> entries = null;
+            
+            // Try variable length index (v3)
+            if (filenameLen > 0 && filenameLen <= 0xFF)
+            {
+                entries = ReadIndex(br, filenameLen, 8, (int)fileCount);
+                if (entries != null)
+                {
+                    version = "v3";
+                    Console.WriteLine("Detected format: v3 (variable length index)");
+                }
+            }
+            
+            // Try v1 format (0x10 filename length)
+            if (entries == null)
+            {
+                entries = ReadIndex(br, 0x10, 4, (int)fileCount);
+                if (entries != null)
+                {
+                    version = "v1";
+                    Console.WriteLine("Detected format: v1 (0x10 index)");
+                }
+            }
+            
+            // Try v2 format (0x38 filename length)
+            if (entries == null)
+            {
+                entries = ReadIndex(br, 0x38, 4, (int)fileCount);
+                if (entries != null)
+                {
+                    version = "v2";
+                    Console.WriteLine("Detected format: v2 (0x38 index)");
+                }
+            }
+            
+            if (entries == null)
+            {
+                throw new InvalidDataException("Could not detect archive format");
+            }
+            
+            ExtractFiles(br, entries, outputPath, keyBytes, version, inputPath);
         }
-
-        private bool IsValidPlacement(long offset, long size, long maxOffset) =>
-            offset >= 0 && size >= 0 && (offset + size) <= maxOffset;
-
-        private IList<Entry> ReadIndex(uint filenameLen, uint indexOffset, int count)
+        
+        private bool IsSaneCount(uint count) => count > 0 && count <= 0xFFFFFF;
+        
+        private List<Entry> ReadIndex(BinaryReader br, uint filenameLen, uint indexOffset, int count)
         {
             if (count <= 0 || filenameLen == 0)
                 return null;
-
+                
             uint indexSize = (8u + filenameLen) * (uint)count;
-            if (indexSize > _arcFile.FileSize - indexOffset)
+            if (indexSize > br.BaseStream.Length - indexOffset)
                 return null;
-
-            var directory = new List<Entry>(count);
-            long currentOffset = indexOffset;
-
+                
+            var entries = new List<Entry>(count);
+            br.BaseStream.Seek(indexOffset, SeekOrigin.Begin);
+            
             for (int i = 0; i < count; i++)
             {
-                var entry = ReadEntry(ref currentOffset, filenameLen, indexSize);
+                var entry = ReadEntry(br, filenameLen, indexSize);
                 if (entry == null)
                     return null;
-
-                directory.Add(entry);
+                entries.Add(entry);
             }
-
-            return directory.Count > 0 ? directory : null;
+            
+            return entries.Count > 0 ? entries : null;
         }
-
-        private Entry ReadEntry(ref long currentOffset, uint filenameLen, uint indexSize)
+        
+        private Entry ReadEntry(BinaryReader br, uint filenameLen, uint indexSize)
         {
-            string name = _arcFile.ReadString(currentOffset, (int)filenameLen);
+            long namePosition = br.BaseStream.Position;
+            string name = ReadString(br, (int)filenameLen);
+            
             if (string.IsNullOrEmpty(name))
                 return null;
-
-            name = ProcessFileName(name, filenameLen, currentOffset);
-            currentOffset += filenameLen;
-
-            uint offset = (uint)_arcFile.ReadInt32(currentOffset);
-            uint size = (uint)_arcFile.ReadInt32(currentOffset + 4);
-
-            if (offset < indexSize || !IsValidPlacement(offset, size, _arcFile.FileSize))
+                
+            name = ProcessFileName(br, name, filenameLen, namePosition);
+            
+            // Skip to offset/size data
+            br.BaseStream.Seek(namePosition + filenameLen, SeekOrigin.Begin);
+            uint offset = br.ReadUInt32();
+            uint size = br.ReadUInt32();
+            
+            // Validate entry placement
+            if (offset < indexSize || !IsValidPlacement(offset, size, br.BaseStream.Length))
                 return null;
-
-            currentOffset += 8;
-
+                
             return new Entry
             {
                 Name = name.ToLowerInvariant(),
@@ -69,137 +120,175 @@ namespace Marble
                 Size = (int)size
             };
         }
-
-        private string ProcessFileName(string name, uint filenameLen, long currentOffset)
+        
+        private bool IsValidPlacement(long offset, long size, long maxOffset) =>
+            offset >= 0 && size >= 0 && (offset + size) <= maxOffset;
+            
+        private string ProcessFileName(BinaryReader br, string name, uint filenameLen, long namePosition)
         {
             if (filenameLen - name.Length <= 1)
                 return name;
-
-            string ext = _arcFile.ReadString(
-                currentOffset + name.Length + 1,
-                (int)(filenameLen - name.Length - 1)
-            );
-
+                
+            long extPosition = namePosition + name.Length + 1;
+            int extLength = (int)(filenameLen - name.Length - 1);
+            
+            br.BaseStream.Seek(extPosition, SeekOrigin.Begin);
+            string ext = ReadString(br, extLength);
             return string.IsNullOrEmpty(ext) ? name : Path.ChangeExtension(name, ext);
         }
-
-        public bool Extract()
+        
+        private string ReadString(BinaryReader br, int length)
         {
-            try
+            byte[] bytes = br.ReadBytes(length);
+            int nullIndex = Array.IndexOf(bytes, (byte)0);
+            if (nullIndex >= 0)
             {
-                int count = _arcFile.ReadInt32(0);
-                if (!_arcFile.IsSaneCount(count))
-                    return false;
-
-                uint filenameLen = (uint)_arcFile.ReadInt32(4);
-                
-                if (filenameLen > 0 && filenameLen <= 0xFF)
-                {
-                    var entries = ReadIndex(filenameLen, 8, count);
-                    if (entries != null)
-                    {
-                        _entries.Clear();
-                        foreach (var entry in entries)
-                            _entries.Add(entry);
-                        _version = "v3";  // Variable length index
-                        return true;
-                    }
-                }
-
-                var tempEntries = ReadIndex(0x10, 4, count);
-                if (tempEntries != null)
-                {
-                    _entries.Clear();
-                    foreach (var entry in tempEntries)
-                        _entries.Add(entry);
-                    _version = "v1";  // 0x10 index
-                    return true;
-                }
-
-                tempEntries = ReadIndex(0x38, 4, count);
-                if (tempEntries != null)
-                {
-                    _entries.Clear();
-                    foreach (var entry in tempEntries)
-                        _entries.Add(entry);
-                    _version = "v2";  // 0x38 index
-                    return true;
-                }
-
-                return false;
+                Array.Resize(ref bytes, nullIndex);
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error reading archive: {ex.Message}");
-                return false;
-            }
+            return Encoding.GetEncoding("Shift_JIS").GetString(bytes);
         }
-
-        public void SaveFiles(string outputDir)
+        
+        private void ExtractFiles(BinaryReader br, List<Entry> entries, string outputPath, 
+            byte[] keyBytes, string version, string inputPath)
         {
-            if (string.IsNullOrWhiteSpace(outputDir))
-                throw new ArgumentNullException(nameof(outputDir));
-
-            Directory.CreateDirectory(outputDir);
-
-            if (_entries.Count == 0)
+            Directory.CreateDirectory(outputPath);
+            if (entries.Count == 0)
             {
                 Console.WriteLine("No entries to extract.");
                 return;
             }
-
-            bool containsScripts = Path.GetFileNameWithoutExtension(_arcFile.Filename)
+            
+            bool containsScripts = Path.GetFileNameWithoutExtension(inputPath)
                 .EndsWith("_data", StringComparison.OrdinalIgnoreCase);
-
-            var metadata = new
+                
+            // Initialize metadata file
+            string metadataPath = Path.Combine(outputPath, "index.json");
+            var extractedFiles = new List<string>();
+            InitializeMetadata(metadataPath, version, keyBytes, entries.Count);
+            
+            Console.WriteLine($"Extracting {entries.Count} files...");
+            
+            int extractedCount = 0;
+            foreach (var entry in entries)
             {
-                Key = BitConverter.ToString(_key).Replace("-", ""),
-                Version = _version,
-                Files = _entries.Select(e => e.Name).ToList()
-            };
-
-            foreach (var entry in _entries)
-            {
-                ExtractEntry(entry, outputDir, containsScripts);
+                bool success = ExtractEntry(br, entry, outputPath, keyBytes, containsScripts);
+                if (success)
+                {
+                    extractedFiles.Add(entry.Name);
+                    extractedCount++;
+                    
+                    // Update metadata after each successful extraction
+                    UpdateMetadata(metadataPath, version, keyBytes, entries.Count, 
+                                 extractedFiles, extractedCount);
+                }
             }
-
-            // Write metadata to a single JSON file
-            string metadataPath = Path.Combine(outputDir, "index.json");
-            File.WriteAllText(metadataPath, System.Text.Json.JsonSerializer.Serialize(metadata, new System.Text.Json.JsonSerializerOptions
-            {
-                WriteIndented = true
-            }));
-
-            Console.WriteLine($"Metadata saved to {metadataPath}");
+            
+            Console.WriteLine($"Extraction complete. {extractedCount}/{entries.Count} files extracted.");
         }
-
-        private void ExtractEntry(Entry entry, string outputDir, bool containsScripts)
+        
+        private bool ExtractEntry(BinaryReader br, Entry entry, string outputPath, 
+            byte[] keyBytes, bool containsScripts)
         {
             try
             {
-                byte[] data = new byte[entry.Size];
-                _arcFile.Read((uint)entry.Offset, data, 0, entry.Size);
-
-                bool isScript = containsScripts || 
-                    entry.Name.EndsWith(".s", StringComparison.OrdinalIgnoreCase);
+                br.BaseStream.Seek(entry.Offset, SeekOrigin.Begin);
+                byte[] data = br.ReadBytes(entry.Size);
                 
-                if (isScript)
+                // Decrypt if it's a script file and we have a key
+                bool isScript = containsScripts || entry.Name.EndsWith(".s", StringComparison.OrdinalIgnoreCase);
+                if (isScript && keyBytes != null)
                 {
-                    data = Xor.XorDecrypt(data, _key);
+                    data = Xor.XorDecrypt(data, keyBytes);
                 }
-
-                string outputPath = Path.Combine(outputDir, entry.Name);
-                string directory = Path.GetDirectoryName(outputPath);
+                
+                string filePath = Path.Combine(outputPath, entry.Name);
+                string directory = Path.GetDirectoryName(filePath);
                 if (!string.IsNullOrEmpty(directory))
                     Directory.CreateDirectory(directory);
-
-                File.WriteAllBytes(outputPath, data);
-                Console.WriteLine($"Extracted {entry.Name}");
+                    
+                File.WriteAllBytes(filePath, data);
+                Console.WriteLine($"Extracted: {entry.Name} ({entry.Size} bytes)");
+                return true;
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error extracting {entry.Name}: {ex.Message}");
+                return false;
+            }
+        }
+        
+        private void InitializeMetadata(string metadataPath, string version, byte[] keyBytes, int totalFiles)
+        {
+            try
+            {
+                var metadata = new
+                {
+                    Version = version,
+                    Key = keyBytes != null ? BitConverter.ToString(keyBytes).Replace("-", "") : null,
+                    TotalFileCount = totalFiles,
+                    ExtractedFileCount = 0,
+                    ExtractionStatus = "In Progress",
+                    LastUpdated = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                    Files = new List<string>()
+                };
+                
+                string json = JsonSerializer.Serialize(metadata, new JsonSerializerOptions
+                {
+                    WriteIndented = true
+                });
+                
+                File.WriteAllText(metadataPath, json);
+                Console.WriteLine($"Metadata initialized at: {metadataPath}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Could not initialize metadata: {ex.Message}");
+            }
+        }
+        
+        private void UpdateMetadata(string metadataPath, string version, byte[] keyBytes, 
+            int totalFiles, List<string> extractedFiles, int extractedCount)
+        {
+            try
+            {
+                string status = extractedCount == totalFiles ? "Complete" : "In Progress";
+                
+                var metadata = new
+                {
+                    Version = version,
+                    Key = keyBytes != null ? BitConverter.ToString(keyBytes).Replace("-", "") : null,
+                    TotalFileCount = totalFiles,
+                    ExtractedFileCount = extractedCount,
+                    ExtractionStatus = status,
+                    LastUpdated = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+                    Files = extractedFiles.ToList() // Create a copy to avoid reference issues
+                };
+                
+                string json = JsonSerializer.Serialize(metadata, new JsonSerializerOptions
+                {
+                    WriteIndented = true
+                });
+                
+                // Use atomic write operation to prevent corruption during cancellation
+                string tempPath = metadataPath + ".tmp";
+                File.WriteAllText(tempPath, json);
+                
+                // Replace the original file atomically
+                if (File.Exists(metadataPath))
+                    File.Delete(metadataPath);
+                File.Move(tempPath, metadataPath);
+                
+                // Show progress every 10 files or at completion
+                if (extractedCount % 10 == 0 || status == "Complete")
+                {
+                    Console.WriteLine($"Progress: {extractedCount}/{totalFiles} files - Metadata updated");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Could not update metadata: {ex.Message}");
             }
         }
     }
+    
 }
