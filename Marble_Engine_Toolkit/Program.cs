@@ -1,5 +1,6 @@
-﻿
-namespace Marble
+using System;
+
+namespace MarbleEngineTools
 {
     public class Program
     {
@@ -16,7 +17,8 @@ namespace Marble
         {
             // Register encoding provider for Shift-JIS support
             System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
-            
+			var reader = new PrsReader();
+           
             if (args.Length < 2)
             {
                 PrintUsage();
@@ -65,7 +67,7 @@ namespace Marble
                             PrintUsage();
                             return;
                         }
-                        PrsToPngConverter.ConvertPrsToPng(args[1], args[2]);
+                        reader.ConvertPrsToPng(args[1], args[2]);
                         break;
 
                     case "-cp":
@@ -98,13 +100,9 @@ namespace Marble
                 throw new FileNotFoundException("Archive file not found", archiveFile);
 
             Console.WriteLine($"Extracting {archiveFile} to {outputDir}");
-            var opener = new MblOpener(archiveFile, key);
-            if (!opener.Extract())
-            {
-                throw new InvalidOperationException("Failed to extract archive");
-            }
-            opener.SaveFiles(outputDir);
-            Console.WriteLine("Extraction completed successfully");
+			var Unpacker = new MblOpener();
+			Unpacker.Unpack(archiveFile, outputDir, key);
+            Console.WriteLine("Extraction completed successfully!");
         }
 
         static void PackArchive(string inputDir, string outputArchive)
@@ -112,8 +110,8 @@ namespace Marble
             if (!Directory.Exists(inputDir))
                 throw new DirectoryNotFoundException("Input directory not found");
             
-            var packer = new MblPacker(outputArchive);
-            packer.Pack(inputDir);
+            var packer = new MblPacker();
+            packer.Pack(inputDir,outputArchive);
             Console.WriteLine("Packing completed successfully");
         }
         
