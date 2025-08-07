@@ -2,102 +2,110 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.Json;
 
-namespace Marble
+namespace MarbleEngineTools
 {
     public class MblPacker
     {
-        private readonly ArcOpen _arcFile;
-        private readonly string _outputPath;
-        private readonly IList<Entry> _entries;
-        private byte[] _key;
-        private string _version;
-        private uint _filenameLength;
-
-        public MblPacker(string outputPath)
-        {
-            if (string.IsNullOrWhiteSpace(outputPath))
-                throw new ArgumentNullException(nameof(outputPath));
-
-            _outputPath = outputPath;
-            _arcFile = new ArcOpen(_outputPath, FileMode.Create);
-            _entries = new List<Entry>();
-            _key = ArcEncoding.Shift_JIS.GetBytes(""); // Default key
-        }
-
-        public void Pack(string folderPath)
+        public void Pack(string folderPath, string outputPath)
         {
             if (string.IsNullOrWhiteSpace(folderPath))
                 throw new ArgumentNullException(nameof(folderPath));
+            if (string.IsNullOrWhiteSpace(outputPath))
+                throw new ArgumentNullException(nameof(outputPath));
+
+            Console.WriteLine($"Packing folder: {folderPath}");
+            Console.WriteLine($"Output archive: {outputPath}");
 
             var metadata = ReadMetadata(folderPath);
-            InitializeVersion(metadata);
-
+            var (version, filenameLength, keyBytes) = InitializeFromMetadata(metadata);
             var files = GetOrderedFiles(folderPath, metadata);
 
-            if (_version == "v3")
+            if (version == "v3")
             {
-                _filenameLength = CalculateFilenameLength(files);
+                filenameLength = CalculateFilenameLength(files);
             }
 
-            PreparePacking(files);
-            WriteArchive(files);
+            var entries = PrepareEntries(files, version, filenameLength);
+            WriteArchive(outputPath, entries, files, version, filenameLength, keyBytes);
+
+            Console.WriteLine($"Successfully packed {files.Count} files into {Path.GetFileName(outputPath)}");
         }
 
         private JsonElement ReadMetadata(string folderPath)
         {
             string metadataPath = Path.Combine(folderPath, "index.json");
             if (!File.Exists(metadataPath))
-                throw new FileNotFoundException("Metadata file not found", metadataPath);
+                throw new FileNotFoundException($"Metadata file not found: {metadataPath}");
 
             string jsonContent = File.ReadAllText(metadataPath);
             return JsonSerializer.Deserialize<JsonElement>(jsonContent);
         }
 
-        private void InitializeVersion(JsonElement metadata)
+        private (string version, uint filenameLength, byte[] keyBytes) InitializeFromMetadata(JsonElement metadata)
         {
-            try
+            string version = "v1";
+            if (metadata.TryGetProperty("Version", out JsonElement versionElement))
             {
-                string version = "v1";
+                version = versionElement.GetString()?.ToLowerInvariant() ?? "v1";
+            }
 
-                if (metadata.TryGetProperty("Version", out JsonElement versionElement))
-                {
-                    version = versionElement.GetString()?.ToLowerInvariant() ?? "v1";
-                }
+            uint filenameLength = version switch
+            {
+                "v1" => 0x10,
+                "v2" => 0x38,
+                "v3" => 0, // Will be calculated later
+                _ => throw new ArgumentException($"Invalid version '{version}'")
+            };
 
-                _version = version;
-                _filenameLength = _version switch
+            byte[] keyBytes = null;
+            if (metadata.TryGetProperty("Key", out JsonElement keyElement))
+            {
+                string keyHex = keyElement.GetString();
+                if (!string.IsNullOrEmpty(keyHex))
                 {
-                    "v1" => 0x10,
-                    "v2" => 0x38,
-                    "v3" => 0,
-                    _ => throw new ArgumentException($"Invalid version '{_version}'")
-                };
-
-                // Read key from metadata
-                if (metadata.TryGetProperty("Key", out JsonElement keyElement))
-                {
-                    string keyHex = keyElement.GetString();
-                    if (!string.IsNullOrEmpty(keyHex))
-                    {
-                        _key = Utility.ConvertHexStringToBytes(keyHex);
-                        Console.WriteLine("Key successfully read from metadata.");
-                    }
+                    keyBytes = Utility.ConvertHexStringToBytes(keyHex);
+                    Console.WriteLine("Encryption key loaded from metadata.");
                 }
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error initializing metadata: {ex}");
-            }
+
+            Console.WriteLine($"Archive format: {version.ToUpper()}");
+            return (version, filenameLength, keyBytes);
         }
 
         private List<FileInfo> GetOrderedFiles(string folderPath, JsonElement metadata)
         {
-            var orderedFilenames = metadata.GetProperty("Files").EnumerateArray()
-                .Select(f => f.GetString())
-                .Where(f => f != null)
-                .ToList();
+            var orderedFilenames = new List<string>();
+
+            // Handle both formats: array of strings (old) or array of objects (new)
+            if (metadata.TryGetProperty("Files", out JsonElement filesElement))
+            {
+                foreach (JsonElement fileElement in filesElement.EnumerateArray())
+                {
+                    string filename = null;
+                    
+                    if (fileElement.ValueKind == JsonValueKind.String)
+                    {
+                        // Old format: just filename strings
+                        filename = fileElement.GetString();
+                    }
+                    else if (fileElement.ValueKind == JsonValueKind.Object)
+                    {
+                        // New format: objects with Name property
+                        if (fileElement.TryGetProperty("Name", out JsonElement nameElement))
+                        {
+                            filename = nameElement.GetString();
+                        }
+                    }
+                    
+                    if (!string.IsNullOrEmpty(filename))
+                    {
+                        orderedFilenames.Add(filename);
+                    }
+                }
+            }
 
             if (!orderedFilenames.Any())
                 throw new InvalidOperationException("No files defined in metadata");
@@ -109,9 +117,7 @@ namespace Marble
                 var fileInfo = new FileInfo(fullPath);
 
                 if (!fileInfo.Exists)
-                {
                     throw new FileNotFoundException($"File specified in metadata not found: {filename}");
-                }
 
                 orderedFiles.Add(fileInfo);
             }
@@ -121,88 +127,143 @@ namespace Marble
 
         private uint CalculateFilenameLength(List<FileInfo> files)
         {
-            return files.Select(f => (uint)(GetModifiedFileName(f.Name).Length)).Max();
+            return files.Select(f => (uint)GetModifiedFileName(f.Name).Length).Max();
         }
 
         private string GetModifiedFileName(string fileName)
         {
-            if (fileName.EndsWith(".s", StringComparison.OrdinalIgnoreCase))
-            {
-                return fileName.Substring(0, fileName.Length - 2) + "\0S";
-            }
-            return fileName;
+			string result;
+			if (fileName.EndsWith(".s", StringComparison.OrdinalIgnoreCase))
+			{
+				// Replace .s extension with \x00S
+				result = Path.GetFileNameWithoutExtension(fileName) + "\x00S";
+			}
+			else
+			{
+				// Replace the '.' before the extension with '\x00'
+				int dotIndex = fileName.LastIndexOf('.');
+				if (dotIndex >= 0)
+				{
+					result = fileName.Substring(0, dotIndex) + "\x00" + fileName.Substring(dotIndex + 1);
+				}
+				else
+				{
+					// No extension — leave unchanged
+					result = fileName;
+				}
+			}
+            
+            // Capitalize the filename
+            return result.ToUpperInvariant();
         }
 
-        private void PreparePacking(List<FileInfo> files)
+        private List<Entry> PrepareEntries(List<FileInfo> files, string version, uint filenameLength)
         {
-            _entries.Clear();
+            var entries = new List<Entry>();
+            
+            uint headerSize = version == "v3" ? 8u : 4u; // v3 has file count + filename length, v1/v2 just have file count
+            uint indexSize = (uint)(files.Count * (filenameLength + 8));
+            uint paddingSize = version == "v3" ? 0u : 4u; // v1/v2 have 4 null bytes after header
+            uint currentOffset = headerSize + indexSize + paddingSize;
 
-            uint headerSize = _version == "v1" || _version == "v2" ? 4u + 4u : 8u;
-            uint indexSize = (uint)(files.Count * (_filenameLength + 8));
-            uint currentOffset = headerSize + indexSize;
+            // Validate that we won't exceed reasonable file size limits
+            long totalSize = currentOffset;
+            foreach (var file in files)
+            {
+                totalSize += file.Length;
+                if (totalSize > int.MaxValue)
+                    throw new InvalidOperationException("Archive would exceed maximum supported size");
+            }
 
             foreach (var file in files)
             {
-                _entries.Add(new Entry
+                string modifiedName = GetModifiedFileName(file.Name);
+                
+                // Validate filename length
+                if (version != "v3" && modifiedName.Length >= filenameLength)
                 {
-                    Name = GetModifiedFileName(file.Name).ToUpperInvariant(),
+                    throw new InvalidOperationException(
+                        $"Filename '{modifiedName}' is too long for format {version} (max {filenameLength - 1} characters)");
+                }
+
+                entries.Add(new Entry
+                {
+                    Name = modifiedName,
                     Offset = (int)currentOffset,
-                    Size = (int)file.Length
+                    Size = (int)file.Length,
+                    OriginalPath = file.FullName
                 });
 
                 currentOffset += (uint)file.Length;
             }
+
+            return entries;
         }
 
-        private void WriteArchive(List<FileInfo> files)
+        private void WriteArchive(string outputPath, List<Entry> entries, List<FileInfo> files, 
+            string version, uint filenameLength, byte[] keyBytes)
         {
-            long totalSize = CalculateTotalSize(files);
-            _arcFile.SetLength(totalSize);
+            using var fs = new FileStream(outputPath, FileMode.Create, FileAccess.Write);
+            using var bw = new BinaryWriter(fs);
 
-            _arcFile.Seek(0);
-            _arcFile.WriteInt32(files.Count);
-
-            if (_version != "v1" && _version != "v2")
+            // Write header based on version
+            bw.Write((uint)files.Count);
+            if (version == "v3")
             {
-                _arcFile.WriteUInt32(_filenameLength);
+                bw.Write(filenameLength);
             }
 
-            foreach (var entry in _entries)
+            // Write index
+            foreach (var entry in entries)
             {
-                _arcFile.WriteFixedLengthString(entry.Name, (int)_filenameLength);
-                _arcFile.WriteInt32(entry.Offset);
-                _arcFile.WriteInt32(entry.Size);
+                Utility.WriteFixedLengthString(bw, entry.Name, (int)filenameLength);
+                bw.Write((uint)entry.Offset);
+                bw.Write((uint)entry.Size);
             }
 
-            foreach (var file in files)
+            // Write padding for v1/v2 formats (4 null bytes after entire header section)
+            if (version != "v3")
             {
-                var entry = _entries.First(e => e.Name == GetModifiedFileName(file.Name).ToUpperInvariant());
-                _arcFile.Seek(entry.Offset);
+                bw.Write((uint)0);
+            }
 
-                byte[] data = File.ReadAllBytes(file.FullName);
-                bool isScript = file.Name.EndsWith(".s", StringComparison.OrdinalIgnoreCase) ||
-                               file.Directory?.Name.EndsWith("_data", StringComparison.OrdinalIgnoreCase) == true;
+            // Write file data
+            bool containsScripts = Path.GetFileNameWithoutExtension(outputPath)
+                .EndsWith("_data", StringComparison.OrdinalIgnoreCase);
 
-                if (isScript)
+            for (int i = 0; i < files.Count; i++)
+            {
+                var file = files[i];
+                var entry = entries[i];
+
+                // Validate offset before seeking
+                if (entry.Offset < 0 || entry.Offset > fs.Length)
                 {
-                    data = Xor.XorEncrypt(data, _key);
+                    throw new InvalidOperationException($"Invalid offset calculated for file {file.Name}: {entry.Offset}");
                 }
 
-                _arcFile.Write(data);
+                fs.Seek(entry.Offset, SeekOrigin.Begin);
+                
+                byte[] data = File.ReadAllBytes(file.FullName);
+                
+                // Verify data size matches expected
+                if (data.Length != entry.Size)
+                {
+                    throw new InvalidOperationException(
+                        $"File size mismatch for {file.Name}: expected {entry.Size}, got {data.Length}");
+                }
+                
+                bool isScript = containsScripts || 
+                    file.Name.EndsWith(".s", StringComparison.OrdinalIgnoreCase);
+                
+                if (isScript && keyBytes != null)
+                {
+                    data = Xor.XorEncrypt(data, keyBytes);
+                }
+
+                bw.Write(data);
+                Console.WriteLine($"Packed: {file.Name} ({data.Length} bytes)");
             }
-        }
-
-        private long CalculateTotalSize(List<FileInfo> files)
-        {
-            long size = _version == "v1" || _version == "v2" ? 4 : 8;
-            size += files.Count * (_filenameLength + 8);
-
-            foreach (var file in files)
-            {
-                size += file.Length;
-            }
-
-            return size;
         }
     }
 }
